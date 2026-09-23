@@ -1,0 +1,109 @@
+name: Build and publish Go World
+
+on:
+  repository_dispatch:
+    types: [publish-go-world]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-go-world
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate source commit
+        env:
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_REPO" = 'Neburb/gen1recomp-go'
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out exact private source commit
+        uses: actions/checkout@v4
+        with:
+          repository: Neburb/gen1recomp-go
+          ref: ${{ github.event.client_payload.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: Determine release version
+        id: version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from pathlib import Path
+
+          manifest = json.loads(Path('source/manifest.json').read_text(encoding='utf-8'))
+          version = manifest['version']
+          if not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', version):
+              raise SystemExit(f'Invalid release version: {version!r}')
+          print(f'version={version}')
+          print(f'tag=v{version}')
+          print(f'prerelease={str("-" in version).lower()}')
+          PY
+
+      - name: Build and verify installable ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 source/build.py --package --public-origin \
+            --output "dist/go_world-${VERSION}.zip"
+          python3 - <<'PY'
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          version = os.environ['VERSION']
+          path = Path(f'dist/go_world-{version}.zip')
+          with zipfile.ZipFile(path) as archive:
+              manifest = json.loads(archive.read('manifest.json'))
+              names = set(archive.namelist())
+          if manifest['version'] != version or manifest.get('github') != 'Neburb/go-mod':
+              raise SystemExit('Packaged manifest does not match public release')
+          if not {'main.lua', 'mod.card', 'config.json', 'GO-GPS-automate.flo'} <= names:
+              raise SystemExit('Package is missing required install files')
+          if any(name.startswith('.github/') or name.endswith('.py') for name in names):
+              raise SystemExit('Package contains source-only files')
+          PY
+          (cd dist && sha256sum "go_world-${VERSION}.zip" > sha256sums.txt)
+
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; increase the manifest version before publishing another commit." >&2
+            exit 1
+          fi
+          release_id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+            -f "tag_name=${TAG}" \
+            -f target_commitish=main \
+            -f "name=Go World ${VERSION}" \
+            -f "body=Package built from private source commit ${SOURCE_SHA}. Source: https://github.com/Neburb/gen1recomp-go/commit/${SOURCE_SHA}" \
+            -F draft=true -F "prerelease=${PRERELEASE}" \
+            --jq '.id')
+          gh release upload "$TAG" "dist/go_world-${VERSION}.zip" dist/sha256sums.txt
+          assets=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+            --jq '.[].name')
+          grep -Fxq "go_world-${VERSION}.zip" <<< "$assets"
+          grep -Fxq 'sha256sums.txt' <<< "$assets"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false >/dev/null
